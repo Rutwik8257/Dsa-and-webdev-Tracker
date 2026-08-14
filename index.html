@@ -274,6 +274,14 @@ label{display:block;font-size:11.5px;color:var(--text-dim);margin-bottom:5px;fon
 (function(){
 "use strict";
 
+/* ============================= CONFIG ============================= */
+// Fill these in after you deploy the backend (see tracker-backend/README.md).
+// Leave API_BASE_URL empty to fall back to Claude's built-in artifact storage instead.
+const CONFIG = {
+  API_BASE_URL: "",   // e.g. "https://your-app.onrender.com"
+  API_KEY: ""         // the same random string you set as API_KEY on your host
+};
+
 /* ============================= CONSTANTS ============================= */
 const DOW = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
 const DOW_SHORT = ["S","M","T","W","T","F","S"];
@@ -372,34 +380,64 @@ function topicStatusForDay(topicName, iso){
   return "partial";
 }
 
-/* ---- persistence via window.storage (Claude artifact storage) ---- */
+/* ---- persistence: MongoDB API (preferred) with Claude artifact storage as fallback ---- */
 async function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
+function usingApi(){ return !!CONFIG.API_BASE_URL; }
+function apiHeaders(){
+  const h = { "Content-Type": "application/json" };
+  if(CONFIG.API_KEY) h["x-api-key"] = CONFIG.API_KEY;
+  return h;
+}
+function normalizeLoadedState(parsed){
+  state = Object.assign(defaultState(), parsed);
+  if(!state.schedule) state.schedule = JSON.parse(JSON.stringify(DEFAULT_SCHEDULE));
+  if(!state.dailyLogs) state.dailyLogs = {};
+  if(!state.ui) state.ui = {lastTab:"dashboard"};
+}
+
 async function loadState(){
-  // Try a few times — the storage backend occasionally has a transient hiccup on first call.
+  if(usingApi()){
+    for(let attempt=1; attempt<=3; attempt++){
+      try{
+        const res = await fetch(`${CONFIG.API_BASE_URL}/api/state`, { headers: apiHeaders() });
+        if(!res.ok){
+          const body = await res.text().catch(()=> "");
+          throw new Error(`API responded ${res.status}: ${body}`);
+        }
+        const json = await res.json();
+        if(json.data){ normalizeLoadedState(json.data); } else { state = defaultState(); }
+        setStorageStatus("synced ✓ (db)");
+        return;
+      }catch(e){
+        console.warn(`DB load attempt ${attempt} failed:`, e);
+        if(attempt < 3){ await sleep(500 * attempt); continue; }
+        setStorageStatus("db offline — retry ⟳");
+        toast("⚠ Could not reach your database. Using an unsaved local session until it reconnects — export a backup before closing the tab.");
+      }
+    }
+    state = defaultState();
+    return;
+  }
+
+  // Fallback: Claude's built-in artifact storage.
   for(let attempt=1; attempt<=3; attempt++){
     try{
       if(!window.storage) break;
       const res = await window.storage.get(STORAGE_KEY, false);
       if(res && res.value){
-        const parsed = JSON.parse(res.value);
-        state = Object.assign(defaultState(), parsed);
-        if(!state.schedule) state.schedule = JSON.parse(JSON.stringify(DEFAULT_SCHEDULE));
-        if(!state.dailyLogs) state.dailyLogs = {};
-        if(!state.ui) state.ui = {lastTab:"dashboard"};
+        normalizeLoadedState(JSON.parse(res.value));
         setStorageStatus("synced ✓");
         return;
       }
-      // No error, just no saved data yet — genuinely a fresh start.
       setStorageStatus("synced ✓");
       state = defaultState();
       return;
     }catch(e){
       console.warn(`Storage load attempt ${attempt} failed:`, e);
       if(attempt < 3){ await sleep(500 * attempt); continue; }
-      // All retries exhausted — start from defaults but make it obvious this isn't necessarily "empty on purpose".
       setStorageStatus("offline — retry ⟳");
-      toast("Couldn't reach saved data — starting fresh locally. Click \"retry ⟳\" in the sidebar to try reconnecting.");
+      toast("Couldn't reach saved data — starting fresh locally. Click \"retry ⟳\" in the sidebar, or set up your own database (see CONFIG at the top of the file).");
     }
   }
   state = defaultState();
@@ -409,7 +447,7 @@ function setStorageStatus(txt){
   const el = document.getElementById("storageStatus");
   if(el){
     el.textContent = txt;
-    el.classList.toggle("status-error", txt.indexOf("offline")===0 || txt.indexOf("failed")>=0);
+    el.classList.toggle("status-error", txt.indexOf("offline")===0 || txt.indexOf("db offline")===0 || txt.indexOf("failed")>=0);
   }
 }
 
@@ -421,6 +459,19 @@ function saveState(){
 
 async function attemptSave(attempt){
   try{
+    if(usingApi()){
+      const res = await fetch(`${CONFIG.API_BASE_URL}/api/state`, {
+        method: "PUT",
+        headers: apiHeaders(),
+        body: JSON.stringify({ data: state })
+      });
+      if(!res.ok){
+        const body = await res.text().catch(()=> "");
+        throw new Error(`API responded ${res.status}: ${body}`);
+      }
+      setStorageStatus("synced ✓ (db)");
+      return;
+    }
     if(window.storage){
       const res = await window.storage.set(STORAGE_KEY, JSON.stringify(state), false);
       if(!res) throw new Error("Storage set returned null");
@@ -432,8 +483,8 @@ async function attemptSave(attempt){
       await sleep(600 * attempt);
       return attemptSave(attempt+1);
     }
-    setStorageStatus("save failed — retry ⟳");
-    toast("⚠ Couldn't save to cloud storage. Your changes are still on screen — click \"retry ⟳\" in the sidebar before closing this tab.");
+    setStorageStatus(usingApi() ? "db offline — retry ⟳" : "save failed — retry ⟳");
+    toast("⚠ Couldn't save. Your changes are still on screen — click \"retry ⟳\" in the sidebar, or export a backup before closing this tab.");
   }
 }
 
@@ -1623,6 +1674,9 @@ async function init(){
   activeTab = state.ui.lastTab || "dashboard";
   document.getElementById("loadingScreen").classList.add("hidden");
   document.getElementById("app").classList.remove("hidden");
+  if(!usingApi()){
+    console.info("No CONFIG.API_BASE_URL set — using Claude's built-in artifact storage. See tracker-backend/README.md to switch to your own MongoDB.");
+  }
   render();
 }
 
